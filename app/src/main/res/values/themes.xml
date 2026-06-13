@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.DocManager" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
