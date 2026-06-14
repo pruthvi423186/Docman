@@ -12,6 +12,9 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlin.time.Duration.Companion.milliseconds
 import javax.inject.Inject
 import com.example.docmanager.util.PreferencesManager
 import com.example.docmanager.util.NetworkMonitor
@@ -24,7 +27,7 @@ class DashboardViewModel @Inject constructor(
     private val repository: DocumentRepository,
     private val preferencesManager: PreferencesManager,
     private val networkMonitor: NetworkMonitor,
-    @ApplicationContext private val context: Context
+    @param:ApplicationContext private val context: Context
 ) : ViewModel() {
 
     val isOnline: StateFlow<Boolean> = networkMonitor.isOnline
@@ -67,24 +70,22 @@ class DashboardViewModel @Inject constructor(
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
     private val _isRefreshing = MutableStateFlow(false)
-    val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
 
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
     private val _searchResults = MutableStateFlow<List<File>>(emptyList())
-    val searchResults: StateFlow<List<File>> = _searchResults.asStateFlow()
 
     private val _isSearching = MutableStateFlow(false)
     val isSearching: StateFlow<Boolean> = _isSearching.asStateFlow()
 
-    var hasShownWelcome = false
-
     private val _selectedFiles = MutableStateFlow<Set<String>>(emptySet())
     val selectedFiles: StateFlow<Set<String>> = _selectedFiles.asStateFlow()
 
+    private val _copiedFiles = MutableStateFlow<Set<String>>(emptySet())
+    val copiedFiles: StateFlow<Set<String>> = _copiedFiles.asStateFlow()
+
     private val _isSelectionModeForced = MutableStateFlow(false)
-    val isSelectionModeForced: StateFlow<Boolean> = _isSelectionModeForced.asStateFlow()
 
     val inSelectionMode: StateFlow<Boolean> = combine(_selectedFiles, _isSelectionModeForced) { selected, forced ->
         selected.isNotEmpty() || forced
@@ -146,6 +147,13 @@ class DashboardViewModel @Inject constructor(
 
     private var currentUserEmail: String = ""
 
+    data class FolderNode(val id: String, val name: String)
+    private val _folderStack = MutableStateFlow<List<FolderNode>>(emptyList())
+    val folderStack: StateFlow<List<FolderNode>> = _folderStack.asStateFlow()
+
+    private val _currentFolderFiles = MutableStateFlow<List<File>>(emptyList())
+    val currentFolderFiles: StateFlow<List<File>> = _currentFolderFiles.asStateFlow()
+
     // Storage quota
     private val _storageUsedBytes = MutableStateFlow(0L)
     val storageUsedBytes: StateFlow<Long> = _storageUsedBytes.asStateFlow()
@@ -199,21 +207,29 @@ class DashboardViewModel @Inject constructor(
             try {
                 // Find document date to save in the right year/month folder
                 val doc = _documents.value.find { it.id == fileId }
+                    ?: _currentFolderFiles.value.find { it.id == fileId }
+                    ?: _searchResults.value.find { it.id == fileId }
                 val year: String
                 val month: String
                 if (doc?.createdTime != null) {
                     val cal = java.util.Calendar.getInstance()
                     cal.timeInMillis = doc.createdTime.value
-                    year = String.format("%04d", cal.get(java.util.Calendar.YEAR))
-                    month = String.format("%02d", cal.get(java.util.Calendar.MONTH) + 1)
+                    year = String.format(java.util.Locale.US, "%04d", cal.get(java.util.Calendar.YEAR))
+                    month = String.format(java.util.Locale.US, "%02d", cal.get(java.util.Calendar.MONTH) + 1)
                 } else {
                     val cal = java.util.Calendar.getInstance()
-                    year = String.format("%04d", cal.get(java.util.Calendar.YEAR))
-                    month = String.format("%02d", cal.get(java.util.Calendar.MONTH) + 1)
+                    year = String.format(java.util.Locale.US, "%04d", cal.get(java.util.Calendar.YEAR))
+                    month = String.format(java.util.Locale.US, "%02d", cal.get(java.util.Calendar.MONTH) + 1)
                 }
                 
                 val destDir = getLocalStorageDir(context, currentUserEmail, year, month)
-                val safeName = fileName.replace("[\\\\/:*?\"<>|]".toRegex(), "_")
+                val ext = getExtensionForMimeType(doc?.mimeType)
+                val nameWithExt = if (ext.isNotEmpty() && !fileName.lowercase().endsWith(".$ext")) {
+                    "$fileName.$ext"
+                } else {
+                    fileName
+                }
+                val safeName = nameWithExt.replace("[\\\\/:*?\"<>|]".toRegex(), "_")
                 val localFile = java.io.File(destDir, safeName)
                 
                 repository.downloadFile(currentUserEmail, fileId, localFile)
@@ -280,6 +296,8 @@ class DashboardViewModel @Inject constructor(
             _storageUsedBytes.value = 0L
             _storageLimitBytes.value = 15L * 1024 * 1024 * 1024
             _profilePhotoUri.value = null
+            _folderStack.value = emptyList()
+            _currentFolderFiles.value = emptyList()
             repository.clearSessionCache()
         }
         currentUserEmail = email
@@ -287,6 +305,10 @@ class DashboardViewModel @Inject constructor(
             loadRecentSuspend()
             fetchStorageQuotaSuspend()
             _profilePhotoUri.value = preferencesManager.savedPhotoUriFlow.first()
+            try {
+                repository.getOrCreateAppFolder(currentUserEmail)
+                loadFolderContents("root_app_folder", "Folders")
+            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
@@ -304,12 +326,6 @@ class DashboardViewModel @Inject constructor(
 
     fun setSortOrder(order: SortOrder) {
         _sortOrder.value = order
-    }
-
-    fun toggleFilter(type: String) {
-        _activeFilters.update { current ->
-            if (current.contains(type)) current - type else current + type
-        }
     }
 
     fun setSingleFilter(type: String?) {
@@ -345,16 +361,23 @@ class DashboardViewModel @Inject constructor(
     fun deleteSelectedFiles() {
         if (currentUserEmail.isEmpty() || _selectedFiles.value.isEmpty()) return
         
-        val filesToDelete = _selectedFiles.value
+        val filesToDelete = _selectedFiles.value.toList()
         viewModelScope.launch {
+            // Optimistic UI updates
+            clearSelection()
+            _documents.update { list -> list.filterNot { it.id in filesToDelete } }
+            _searchResults.update { list -> list.filterNot { it.id in filesToDelete } }
+            
             _isLoading.value = true
             try {
-                filesToDelete.forEach { fileId ->
-                    repository.deleteFile(currentUserEmail, fileId)
+                // Delete in parallel
+                kotlinx.coroutines.coroutineScope {
+                    filesToDelete.map { fileId ->
+                        async(kotlinx.coroutines.Dispatchers.IO) {
+                            deleteSingleFileInternal(fileId)
+                        }
+                    }.awaitAll()
                 }
-                clearSelection()
-                _documents.update { list -> list.filterNot { it.id in filesToDelete } }
-                _searchResults.update { list -> list.filterNot { it.id in filesToDelete } }
             } catch (e: com.google.android.gms.auth.UserRecoverableAuthException) {
                 _authIntent.value = e.intent
             } catch (e: Exception) {
@@ -423,7 +446,13 @@ class DashboardViewModel @Inject constructor(
                     val year = java.text.SimpleDateFormat("yyyy", java.util.Locale.US).format(java.util.Date())
                     val month = java.text.SimpleDateFormat("MM", java.util.Locale.US).format(java.util.Date())
                     val localDir = getLocalStorageDir(context, currentUserEmail, year, month)
-                    val localDestFile = java.io.File(localDir, title)
+                    val ext = getExtensionForMimeType(mimeType)
+                    val safeTitle = if (ext.isNotEmpty() && !title.lowercase().endsWith(".$ext")) {
+                        "$title.$ext"
+                    } else {
+                        title
+                    }
+                    val localDestFile = java.io.File(localDir, safeTitle)
                     
                     val inputStream = context.contentResolver.openInputStream(uri)
                     localDestFile.outputStream().use { outputStream ->
@@ -433,7 +462,7 @@ class DashboardViewModel @Inject constructor(
                     
                     // Enqueue background upload using our saved persistent copy's Uri
                     val fileUri = android.net.Uri.fromFile(localDestFile)
-                    repository.enqueueUpload(fileUri, mimeType, title, currentUserEmail)
+                    repository.enqueueUpload(fileUri, mimeType, safeTitle, currentUserEmail)
                     
                     // Reload recent list so the offline local copy immediately appears!
                     loadRecentSuspend()
@@ -455,7 +484,7 @@ class DashboardViewModel @Inject constructor(
         _isRefreshing.value = true
         val startTime = System.currentTimeMillis()
         try {
-            kotlinx.coroutines.withTimeoutOrNull(10000) {
+            kotlinx.coroutines.withTimeoutOrNull(10000.milliseconds) {
                 loadRecentSuspend()
                 fetchStorageQuotaSuspend()
                 if (searchQuery.value.isNotBlank()) {
@@ -468,7 +497,7 @@ class DashboardViewModel @Inject constructor(
             val elapsedTime = System.currentTimeMillis() - startTime
             val remainingTime = 800L - elapsedTime
             if (remainingTime > 0) {
-                kotlinx.coroutines.delay(remainingTime)
+                kotlinx.coroutines.delay(remainingTime.milliseconds)
             }
             _isRefreshing.value = false
         }
@@ -517,6 +546,276 @@ class DashboardViewModel @Inject constructor(
         }
     }
 
+    fun loadFolderContents(folderId: String, folderName: String) {
+        if (currentUserEmail.isEmpty()) return
+        clearSelection()
+        viewModelScope.launch {
+            // Load local/optimistic files synchronously to avoid screen lag or full screen awaiting loader
+            if (folderId == "root_app_folder") {
+                _currentFolderFiles.value = getLocalCustomFolders(context, currentUserEmail)
+            } else {
+                val folderDir = getLocalCustomFolderDir(context, currentUserEmail, folderName)
+                val localFiles = folderDir.listFiles()?.filter { it.isFile && it.length() > 0 }
+                    ?.map { convertLocalFileToDriveFile(it) } ?: emptyList()
+                _currentFolderFiles.value = localFiles
+            }
+
+            _isLoading.value = true
+            try {
+                // Navigate into folder
+                val currentStack = _folderStack.value.toMutableList()
+                if (folderId == "root_app_folder") { // Dummy ID for root
+                    _folderStack.value = emptyList()
+                    try {
+                        val appFolderId = repository.getOrCreateAppFolder(currentUserEmail)
+                        val driveFiles = repository.listFilesInFolder(currentUserEmail, appFolderId)
+                        val localFolders = getLocalCustomFolders(context, currentUserEmail)
+                        val combined = mergeFolders(localFolders, driveFiles)
+                        _currentFolderFiles.value = combined
+                    } catch (e: Exception) {
+                        // Keep optimistic folders list
+                    }
+                } else {
+                    if (!currentStack.any { it.id == folderId }) {
+                        currentStack.add(FolderNode(folderId, folderName))
+                        _folderStack.value = currentStack
+                    } else {
+                        // Navigating back to an existing folder in stack
+                        val index = currentStack.indexOfFirst { it.id == folderId }
+                        if (index != -1) {
+                            _folderStack.value = currentStack.subList(0, index + 1)
+                        }
+                    }
+                    try {
+                        _currentFolderFiles.value = repository.listFilesInFolder(currentUserEmail, folderId)
+                    } catch (e: Exception) {
+                        // Keep optimistic files list
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _errorMessage.value = "Error loading folder: ${e.message}"
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
+    fun navigateUpFolder() {
+        clearSelection()
+        if (_folderStack.value.isNotEmpty()) {
+            val currentStack = _folderStack.value.toMutableList()
+            currentStack.removeAt(currentStack.lastIndex)
+            _folderStack.value = currentStack
+            
+            if (currentStack.isEmpty()) {
+                loadFolderContents("root_app_folder", "Folders")
+            } else {
+                val parent = currentStack.last()
+                loadFolderContents(parent.id, parent.name)
+            }
+        }
+    }
+
+    fun createCustomFolder(name: String) {
+        if (currentUserEmail.isEmpty()) return
+        viewModelScope.launch {
+            _isLoading.value = true
+            try {
+                // Ensure local folder is created
+                getLocalCustomFolderDir(context, currentUserEmail, name)
+                
+                if (isOnline.value) {
+                    val parentId = if (_folderStack.value.isEmpty()) {
+                        repository.getOrCreateAppFolder(currentUserEmail)
+                    } else {
+                        _folderStack.value.last().id
+                    }
+                    repository.createFolder(currentUserEmail, parentId, name)
+                }
+                
+                // Reload current folder contents
+                if (_folderStack.value.isEmpty()) {
+                    loadFolderContents("root_app_folder", "Folders")
+                } else {
+                    loadFolderContents(_folderStack.value.last().id, _folderStack.value.last().name)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _errorMessage.value = "Error creating folder: ${e.message}"
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
+    fun moveSelectedFilesToFolder(targetFolderId: String) {
+        if (currentUserEmail.isEmpty() || _selectedFiles.value.isEmpty()) return
+        val filesToMove = _selectedFiles.value.toList()
+        viewModelScope.launch {
+            _isLoading.value = true
+            try {
+                val sourceFolderId = if (_folderStack.value.isEmpty()) {
+                    repository.getOrCreateAppFolder(currentUserEmail)
+                } else {
+                    _folderStack.value.last().id
+                }
+                
+                val targetFolderName = _currentFolderFiles.value.find { it.id == targetFolderId }?.name
+                    ?: if (targetFolderId.startsWith("local_folder://")) targetFolderId.removePrefix("local_folder://") else "Folders"
+                
+                kotlinx.coroutines.coroutineScope {
+                    filesToMove.map { fileId ->
+                        async(kotlinx.coroutines.Dispatchers.IO) {
+                            if (!fileId.startsWith("local://")) {
+                                try {
+                                    if (isOnline.value) {
+                                        repository.moveFile(currentUserEmail, fileId, sourceFolderId, targetFolderId)
+                                    }
+                                } catch (e: Exception) { e.printStackTrace() }
+                            }
+                            
+                            val localFile = if (fileId.startsWith("local://")) {
+                                java.io.File(fileId.removePrefix("local://"))
+                            } else {
+                                val docName = _documents.value.find { it.id == fileId }?.name
+                                if (docName != null) findLocalFile(context, currentUserEmail, docName) else null
+                            }
+                            
+                            if (localFile != null && localFile.exists()) {
+                                val destDir = getLocalCustomFolderDir(context, currentUserEmail, targetFolderName)
+                                val destFile = java.io.File(destDir, localFile.name)
+                                if (localFile.absolutePath != destFile.absolutePath) {
+                                    localFile.renameTo(destFile)
+                                }
+                            }
+                        }
+                    }.awaitAll()
+                }
+                clearSelection()
+                // Reload current folder contents
+                if (_folderStack.value.isEmpty()) {
+                    loadFolderContents("root_app_folder", "Folders")
+                } else {
+                    loadFolderContents(_folderStack.value.last().id, _folderStack.value.last().name)
+                }
+                refreshSuspend()
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
+    fun copySelectedFiles() {
+        if (currentUserEmail.isEmpty() || _selectedFiles.value.isEmpty()) return
+        _copiedFiles.value = _selectedFiles.value
+        val count = _selectedFiles.value.size
+        clearSelection()
+        android.widget.Toast.makeText(context, "$count file(s) copied to clipboard.", android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    fun clearCopiedFiles() {
+        _copiedFiles.value = emptySet()
+    }
+
+    fun pasteCopiedFiles(targetFolderId: String) {
+        if (currentUserEmail.isEmpty() || _copiedFiles.value.isEmpty()) return
+        val filesToCopy = _copiedFiles.value.toList()
+        viewModelScope.launch {
+            _isLoading.value = true
+            try {
+                val resolvedTargetId = if (targetFolderId == "root_app_folder") {
+                    repository.getOrCreateAppFolder(currentUserEmail)
+                } else {
+                    targetFolderId
+                }
+
+                val targetFolderName = _currentFolderFiles.value.find { it.id == targetFolderId }?.name
+                    ?: if (targetFolderId.startsWith("local_folder://")) targetFolderId.removePrefix("local_folder://") else "Folders"
+
+                kotlinx.coroutines.coroutineScope {
+                    filesToCopy.map { fileId ->
+                        async(kotlinx.coroutines.Dispatchers.IO) {
+                            // 1. Cloud copy
+                            if (!fileId.startsWith("local://")) {
+                                try {
+                                    if (isOnline.value) {
+                                        repository.copyFile(currentUserEmail, fileId, resolvedTargetId)
+                                    }
+                                } catch (e: Exception) { e.printStackTrace() }
+                            }
+
+                            // 2. Physical local copy
+                            val doc = if (fileId.startsWith("local://")) null else {
+                                _documents.value.find { it.id == fileId }
+                                    ?: _currentFolderFiles.value.find { it.id == fileId }
+                                    ?: _searchResults.value.find { it.id == fileId }
+                            }
+                            val localFile = if (fileId.startsWith("local://")) {
+                                java.io.File(fileId.removePrefix("local://"))
+                            } else {
+                                val docName = doc?.name
+                                if (docName != null) findLocalFile(context, currentUserEmail, docName) else null
+                            }
+
+                            if (localFile != null && localFile.exists()) {
+                                val destDir = if (targetFolderId == "root_app_folder") {
+                                    val year = java.text.SimpleDateFormat("yyyy", java.util.Locale.US).format(java.util.Date())
+                                    val month = java.text.SimpleDateFormat("MM", java.util.Locale.US).format(java.util.Date())
+                                    getLocalStorageDir(context, currentUserEmail, year, month)
+                                } else {
+                                    getLocalCustomFolderDir(context, currentUserEmail, targetFolderName)
+                                }
+                                
+                                val mimeType = doc?.mimeType ?: run {
+                                    val ext = localFile.extension.lowercase()
+                                    when (ext) {
+                                        "pdf" -> "application/pdf"
+                                        "jpg", "jpeg" -> "image/jpeg"
+                                        "png" -> "image/png"
+                                        "webp" -> "image/webp"
+                                        "xls", "xlsx" -> "application/vnd.ms-excel"
+                                        "doc", "docx" -> "application/msword"
+                                        "ppt", "pptx" -> "application/vnd.ms-powerpoint"
+                                        "txt" -> "text/plain"
+                                        "csv" -> "text/csv"
+                                        else -> "application/octet-stream"
+                                    }
+                                }
+                                val ext = getExtensionForMimeType(mimeType)
+                                val originalName = localFile.name
+                                val destFileName = if (ext.isNotEmpty() && !originalName.lowercase().endsWith(".$ext")) {
+                                    "$originalName.$ext"
+                                } else {
+                                    originalName
+                                }
+                                
+                                val destFile = java.io.File(destDir, destFileName)
+                                if (localFile.absolutePath != destFile.absolutePath) {
+                                    localFile.copyTo(destFile, overwrite = true)
+                                }
+                            }
+                        }
+                    }.awaitAll()
+                }
+                clearCopiedFiles()
+                // Reload current folder contents
+                if (_folderStack.value.isEmpty()) {
+                    loadFolderContents("root_app_folder", "Folders")
+                } else {
+                    loadFolderContents(_folderStack.value.last().id, _folderStack.value.last().name)
+                }
+                refreshSuspend()
+                android.widget.Toast.makeText(context, "Pasted successfully.", android.widget.Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _errorMessage.value = "Error pasting files: ${e.message}"
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
     private suspend fun fetchStorageQuotaSuspend() {
         if (currentUserEmail.isEmpty()) return
         try {
@@ -557,22 +856,40 @@ class DashboardViewModel @Inject constructor(
 
                 repository.downloadFile(currentUserEmail, fileId, localFile)
 
-                // Copy to Downloads via MediaStore
-                val resolver = context.contentResolver
-                val contentValues = android.content.ContentValues().apply {
-                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, safeName)
-                    put(android.provider.MediaStore.Downloads.MIME_TYPE, mimeType)
-                    put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val collection = android.provider.MediaStore.Downloads.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                val itemUri = resolver.insert(collection, contentValues)
-                if (itemUri != null) {
-                    resolver.openOutputStream(itemUri)?.use { outputStream ->
-                        localFile.inputStream().use { it.copyTo(outputStream) }
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    // Copy to Downloads via MediaStore for API >= 29
+                    val resolver = context.contentResolver
+                    val contentValues = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Downloads.DISPLAY_NAME, safeName)
+                        put(android.provider.MediaStore.Downloads.MIME_TYPE, mimeType)
+                        put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
                     }
-                    contentValues.clear()
-                    contentValues.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(itemUri, contentValues, null, null)
+                    val collection = android.provider.MediaStore.Downloads.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                    val itemUri = resolver.insert(collection, contentValues)
+                    if (itemUri != null) {
+                        resolver.openOutputStream(itemUri)?.use { outputStream ->
+                            localFile.inputStream().use { it.copyTo(outputStream) }
+                        }
+                        contentValues.clear()
+                        contentValues.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                        resolver.update(itemUri, contentValues, null, null)
+                        android.widget.Toast.makeText(context, "Saved to Downloads", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    // Fallback for API < 29 (Pre-Android 10)
+                    val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                    val destFile = java.io.File(downloadsDir, safeName)
+                    localFile.inputStream().use { input ->
+                        destFile.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    android.media.MediaScannerConnection.scanFile(
+                        context,
+                        arrayOf(destFile.absolutePath),
+                        arrayOf(mimeType),
+                        null
+                    )
                     android.widget.Toast.makeText(context, "Saved to Downloads", android.widget.Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
@@ -582,10 +899,6 @@ class DashboardViewModel @Inject constructor(
                 _isDownloadingFile.value = null
             }
         }
-    }
-
-    fun setSelectionModeForced(forced: Boolean) {
-        _isSelectionModeForced.value = forced
     }
 
     fun setSearchDateFilter(filter: String) {
@@ -601,8 +914,38 @@ class DashboardViewModel @Inject constructor(
         viewModelScope.launch {
             _isLoading.value = true
             try {
-                repository.renameFile(currentUserEmail, fileId, newName)
+                val doc = _documents.value.find { it.id == fileId }
+                    ?: _currentFolderFiles.value.find { it.id == fileId }
+                val oldName = doc?.name
+
+                if (fileId.startsWith("local_folder://")) {
+                    val oldFolderName = fileId.removePrefix("local_folder://")
+                    val oldFolderDir = getLocalCustomFolderDir(context, currentUserEmail, oldFolderName)
+                    val newFolderDir = getLocalCustomFolderDir(context, currentUserEmail, newName)
+                    if (oldFolderDir.exists() && oldFolderDir.absolutePath != newFolderDir.absolutePath) {
+                        oldFolderDir.renameTo(newFolderDir)
+                    }
+                } else {
+                    if (isOnline.value) {
+                        repository.renameFile(currentUserEmail, fileId, newName)
+                    }
+                    if (doc?.mimeType == "application/vnd.google-apps.folder" && oldName != null) {
+                        val oldFolderDir = getLocalCustomFolderDir(context, currentUserEmail, oldName)
+                        val newFolderDir = getLocalCustomFolderDir(context, currentUserEmail, newName)
+                        if (oldFolderDir.exists() && oldFolderDir.absolutePath != newFolderDir.absolutePath) {
+                            oldFolderDir.renameTo(newFolderDir)
+                        }
+                    }
+                }
+
                 _documents.update { list ->
+                    list.map { file ->
+                        if (file.id == fileId) {
+                            file.clone().setName(newName)
+                        } else file
+                    }
+                }
+                _currentFolderFiles.update { list ->
                     list.map { file ->
                         if (file.id == fileId) {
                             file.clone().setName(newName)
@@ -630,11 +973,22 @@ class DashboardViewModel @Inject constructor(
     fun deleteSingleFile(fileId: String) {
         if (currentUserEmail.isEmpty()) return
         viewModelScope.launch {
+            // Optimistic UI updates
+            _documents.update { list -> list.filterNot { it.id == fileId } }
+            _searchResults.update { list -> list.filterNot { it.id == fileId } }
+            _currentFolderFiles.update { list -> list.filterNot { it.id == fileId } }
+            
             _isLoading.value = true
             try {
-                repository.deleteFile(currentUserEmail, fileId)
-                _documents.update { list -> list.filterNot { it.id == fileId } }
-                _searchResults.update { list -> list.filterNot { it.id == fileId } }
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    deleteSingleFileInternal(fileId)
+                }
+                // Reload current folder contents to reflect deletion
+                if (_folderStack.value.isEmpty()) {
+                    loadFolderContents("root_app_folder", "Folders")
+                } else {
+                    loadFolderContents(_folderStack.value.last().id, _folderStack.value.last().name)
+                }
             } catch (e: com.google.android.gms.auth.UserRecoverableAuthException) {
                 _authIntent.value = e.intent
             } catch (e: Exception) {
@@ -643,6 +997,111 @@ class DashboardViewModel @Inject constructor(
             } finally {
                 _isLoading.value = false
             }
+        }
+    }
+
+    private suspend fun deleteSingleFileInternal(fileId: String) {
+        if (fileId.startsWith("local_folder://")) {
+            val folderName = fileId.removePrefix("local_folder://")
+            val localFolderDir = getLocalCustomFolderDir(context, currentUserEmail, folderName)
+            if (localFolderDir.exists()) {
+                localFolderDir.deleteRecursively()
+            }
+            try {
+                if (isOnline.value) {
+                    val appFolderId = repository.getOrCreateAppFolder(currentUserEmail)
+                    val cloudFolders = repository.listFilesInFolder(currentUserEmail, appFolderId)
+                        .filter { it.mimeType == "application/vnd.google-apps.folder" && it.name == folderName }
+                    cloudFolders.forEach { cloudFolder ->
+                        cloudFolder.id?.let { repository.deleteFile(currentUserEmail, it) }
+                    }
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+        } else if (fileId.startsWith("local://")) {
+            val path = fileId.removePrefix("local://")
+            val localFile = java.io.File(path)
+            val name = localFile.name
+            if (localFile.exists()) {
+                localFile.delete()
+            }
+            // Now attempt to find cloud file with same name and delete it
+            try {
+                val cloudFiles = repository.searchDocuments(currentUserEmail, "name='$name'")
+                cloudFiles.forEach { cloudFile ->
+                    cloudFile.id?.let { repository.deleteFile(currentUserEmail, it) }
+                }
+            } catch (e: Exception) { e.printStackTrace() }
+        } else {
+            // It's a cloud file or folder
+            val doc = _documents.value.find { it.id == fileId }
+                ?: _currentFolderFiles.value.find { it.id == fileId }
+
+            if (isOnline.value) {
+                repository.deleteFile(currentUserEmail, fileId)
+            }
+
+            if (doc != null) {
+                if (doc.mimeType == "application/vnd.google-apps.folder") {
+                    val folderName = doc.name
+                    if (folderName != null) {
+                        val localFolderDir = getLocalCustomFolderDir(context, currentUserEmail, folderName)
+                        if (localFolderDir.exists()) {
+                            localFolderDir.deleteRecursively()
+                        }
+                    }
+                } else {
+                    val name = doc.name
+                    if (name != null) {
+                        val currentFolder = _folderStack.value.lastOrNull()
+                        val localFile = if (currentFolder != null) {
+                            val folderDir = getLocalCustomFolderDir(context, currentUserEmail, currentFolder.name)
+                            val fileInFolder = java.io.File(folderDir, name)
+                            if (fileInFolder.exists()) fileInFolder else {
+                                folderDir.listFiles()?.find { it.nameWithoutExtension.equals(name, ignoreCase = true) || it.name.equals(name, ignoreCase = true) }
+                            }
+                        } else {
+                            val year: String
+                            val month: String
+                            if (doc.createdTime != null) {
+                                val cal = java.util.Calendar.getInstance()
+                                cal.timeInMillis = doc.createdTime.value
+                                year = String.format(java.util.Locale.US, "%04d", cal.get(java.util.Calendar.YEAR))
+                                month = String.format(java.util.Locale.US, "%02d", cal.get(java.util.Calendar.MONTH) + 1)
+                            } else {
+                                val cal = java.util.Calendar.getInstance()
+                                year = String.format(java.util.Locale.US, "%04d", cal.get(java.util.Calendar.YEAR))
+                                month = String.format(java.util.Locale.US, "%02d", cal.get(java.util.Calendar.MONTH) + 1)
+                            }
+                            val localDir = getLocalStorageDir(context, currentUserEmail, year, month)
+                            val fileInDir = java.io.File(localDir, name)
+                            if (fileInDir.exists()) fileInDir else {
+                                localDir.listFiles()?.find { it.nameWithoutExtension.equals(name, ignoreCase = true) || it.name.equals(name, ignoreCase = true) }
+                            }
+                        } ?: findLocalFile(context, currentUserEmail, name)
+                        
+                        if (localFile != null && localFile.exists()) {
+                            localFile.delete()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun getAllCustomFoldersSuspend(): List<File> {
+        if (currentUserEmail.isEmpty()) return emptyList()
+        val localFolders = getLocalCustomFolders(context, currentUserEmail)
+        return try {
+            if (isOnline.value) {
+                val appFolderId = repository.getOrCreateAppFolder(currentUserEmail)
+                val driveFiles = repository.listFilesInFolder(currentUserEmail, appFolderId)
+                val driveFolders = driveFiles.filter { it.mimeType == "application/vnd.google-apps.folder" }
+                mergeFolders(localFolders, driveFolders)
+            } else {
+                localFolders
+            }
+        } catch (e: Exception) {
+            localFolders
         }
     }
 
@@ -663,6 +1122,45 @@ class DashboardViewModel @Inject constructor(
         return monthDir
     }
 
+    fun getLocalCustomFolderDir(context: android.content.Context, email: String, folderName: String): java.io.File {
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val docManagerDir = java.io.File(baseDir, "DocumentManager")
+        val userFolderName = if (email.contains("rajprudvi", ignoreCase = true)) {
+            "gmail"
+        } else {
+            email.substringBefore("@").replace("[^a-zA-Z0-9]".toRegex(), "_").ifEmpty { "user" }
+        }
+        val userDir = java.io.File(docManagerDir, userFolderName)
+        val customFolderDir = java.io.File(userDir, folderName)
+        if (!customFolderDir.exists()) {
+            customFolderDir.mkdirs()
+        }
+        return customFolderDir
+    }
+
+    fun getLocalCustomFolders(context: android.content.Context, email: String): List<File> {
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val docManagerDir = java.io.File(baseDir, "DocumentManager")
+        val userFolderName = if (email.contains("rajprudvi", ignoreCase = true)) {
+            "gmail"
+        } else {
+            email.substringBefore("@").replace("[^a-zA-Z0-9]".toRegex(), "_").ifEmpty { "user" }
+        }
+        val userDir = java.io.File(docManagerDir, userFolderName)
+        if (!userDir.exists()) return emptyList()
+        
+        return userDir.listFiles()?.filter { child ->
+            child.isDirectory && !child.name.matches("\\d{4}".toRegex())
+        }?.map { dir ->
+            val driveFolder = File()
+            driveFolder.id = "local_folder://${dir.name}"
+            driveFolder.name = dir.name
+            driveFolder.mimeType = "application/vnd.google-apps.folder"
+            driveFolder.createdTime = com.google.api.client.util.DateTime(dir.lastModified())
+            driveFolder
+        } ?: emptyList()
+    }
+
     fun getLocalFilesForUser(context: android.content.Context, email: String): List<java.io.File> {
         val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
         val docManagerDir = java.io.File(baseDir, "DocumentManager")
@@ -675,16 +1173,15 @@ class DashboardViewModel @Inject constructor(
         if (!userDir.exists()) return emptyList()
         
         val resultList = mutableListOf<java.io.File>()
-        userDir.listFiles()?.forEach { yearDir ->
-            if (yearDir.isDirectory) {
-                yearDir.listFiles()?.forEach { monthDir ->
-                    if (monthDir.isDirectory) {
-                        monthDir.listFiles()?.forEach { file ->
-                            if (file.isFile && file.length() > 0) {
-                                resultList.add(file)
-                            }
-                        }
-                    }
+        val queue = java.util.LinkedList<java.io.File>()
+        queue.add(userDir)
+        while (queue.isNotEmpty()) {
+            val dir = queue.removeFirst()
+            dir.listFiles()?.forEach { child ->
+                if (child.isDirectory) {
+                    queue.add(child)
+                } else if (child.isFile && child.length() > 0) {
+                    resultList.add(child)
                 }
             }
         }
@@ -702,14 +1199,17 @@ class DashboardViewModel @Inject constructor(
         val userDir = java.io.File(docManagerDir, userFolderName)
         if (!userDir.exists()) return null
         
-        userDir.listFiles()?.forEach { yearDir ->
-            if (yearDir.isDirectory) {
-                yearDir.listFiles()?.forEach { monthDir ->
-                    if (monthDir.isDirectory) {
-                        val file = java.io.File(monthDir, fileName)
-                        if (file.exists() && file.length() > 0) {
-                            return file
-                        }
+        val queue = java.util.LinkedList<java.io.File>()
+        queue.add(userDir)
+        while (queue.isNotEmpty()) {
+            val dir = queue.removeFirst()
+            dir.listFiles()?.forEach { child ->
+                if (child.isDirectory) {
+                    queue.add(child)
+                } else if (child.isFile && child.length() > 0) {
+                    val nameWithoutExt = child.nameWithoutExtension
+                    if (child.name.equals(fileName, ignoreCase = true) || nameWithoutExt.equals(fileName, ignoreCase = true)) {
+                        return child
                     }
                 }
             }
@@ -717,7 +1217,7 @@ class DashboardViewModel @Inject constructor(
         return null
     }
 
-    fun convertLocalFileToDriveFile(file: java.io.File): com.google.api.services.drive.model.File {
+    fun convertLocalFileToDriveFile(file: java.io.File): File {
         val driveFile = com.google.api.services.drive.model.File()
         driveFile.id = "local://${file.absolutePath}"
         driveFile.name = file.name
@@ -747,5 +1247,27 @@ class DashboardViewModel @Inject constructor(
         val driveNames = drive.mapNotNull { it.name?.lowercase() }.toSet()
         val uniqueLocal = local.filterNot { it.name?.lowercase() in driveNames }
         return drive + uniqueLocal
+    }
+
+    private fun mergeFolders(local: List<File>, drive: List<File>): List<File> {
+        val driveFolderNames = drive.filter { it.mimeType == "application/vnd.google-apps.folder" }
+            .mapNotNull { it.name?.lowercase() }.toSet()
+        val uniqueLocal = local.filterNot { it.name?.lowercase() in driveFolderNames }
+        return drive + uniqueLocal
+    }
+
+    private fun getExtensionForMimeType(mimeType: String?): String {
+        val mime = mimeType?.lowercase() ?: return ""
+        return when {
+            mime.contains("pdf") -> "pdf"
+            mime.contains("jpeg") || mime.contains("jpg") -> "jpg"
+            mime.contains("png") -> "png"
+            mime.contains("webp") -> "webp"
+            mime.contains("excel") || mime.contains("spreadsheet") || mime.contains("csv") -> "xlsx"
+            mime.contains("word") || mime.contains("document") -> "docx"
+            mime.contains("powerpoint") || mime.contains("presentation") -> "pptx"
+            mime.contains("text/plain") || mime.contains("txt") -> "txt"
+            else -> ""
+        }
     }
 }

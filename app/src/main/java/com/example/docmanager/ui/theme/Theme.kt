@@ -90,10 +90,10 @@ private val LightColorScheme = lightColorScheme(
     errorContainer = Rose100,
     onErrorContainer = Rose800,
     
-    background = Color(0xFF909FAF),
-    onBackground = Color(0xFF0A0720),
+    background = Color(0xFFFAEAD3),
+    onBackground = Color(0xFF4A2C2A),
     surface = Color.White,
-    onSurface = Color(0xFF0A0720),
+    onSurface = Color(0xFF4A2C2A),
     surfaceVariant = Color(0xFFE2E8F0),
     onSurfaceVariant = Color(0xFF1E293B),
     
@@ -139,7 +139,7 @@ fun DocManagerTheme(
         SideEffect {
             val window = (view.context as Activity).window
             window.statusBarColor = colorScheme.background.toArgb()
-            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = false
+            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
         }
     }
 

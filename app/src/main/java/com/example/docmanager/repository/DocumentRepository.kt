@@ -39,6 +39,26 @@ class DocumentRepository @Inject constructor(
         driveServiceWrapper.renameFile(email, fileId, newName)
     }
 
+    suspend fun createFolder(email: String, parentId: String, name: String): File {
+        return driveServiceWrapper.createFolder(email, parentId, name)
+    }
+
+    suspend fun moveFile(email: String, fileId: String, oldParentId: String, newParentId: String): File {
+        return driveServiceWrapper.moveFile(email, fileId, oldParentId, newParentId)
+    }
+
+    suspend fun copyFile(email: String, fileId: String, newParentId: String): File {
+        return driveServiceWrapper.copyFile(email, fileId, newParentId)
+    }
+
+    suspend fun listFilesInFolder(email: String, folderId: String): List<File> {
+        return driveServiceWrapper.listFilesInFolder(email, folderId)
+    }
+
+    suspend fun getOrCreateAppFolder(email: String): String {
+        return driveServiceWrapper.getOrCreateAppFolder(email)
+    }
+
     fun enqueueUpload(uri: Uri, mimeType: String, title: String, email: String): java.util.UUID {
         val inputData = Data.Builder()
             .putString(UploadWorker.KEY_FILE_URI, uri.toString())

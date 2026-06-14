@@ -20,6 +20,8 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File as JavaFile
 
 @Singleton
@@ -28,6 +30,7 @@ class DriveServiceWrapper @Inject constructor(
 ) {
     private val folderName = "DocumentManager"
     private var folderId: String? = null
+    private val folderMutex = kotlinx.coroutines.sync.Mutex()
 
     fun clearSessionCache() {
         folderId = null
@@ -60,34 +63,79 @@ class DriveServiceWrapper @Inject constructor(
     }
 
     suspend fun getOrCreateAppFolder(email: String): String = withContext(Dispatchers.IO) {
-        val service = getDriveService(email)
-        
-        folderId?.let { return@withContext it }
+        folderMutex.withLock {
+            folderId?.let { return@withLock it }
+            val service = getDriveService(email)
 
-        val query = "mimeType='application/vnd.google-apps.folder' and name='$folderName' and trashed=false"
+            val query = "mimeType='application/vnd.google-apps.folder' and name='$folderName' and trashed=false"
+            val result = service.files().list()
+                .setQ(query)
+                .setSpaces("drive")
+                .setFields("files(id, name)")
+                .execute()
+
+            val files = result.files
+            if (!files.isNullOrEmpty()) {
+                folderId = files[0].id
+                return@withLock folderId!!
+            }
+
+            val folderMetadata = File().apply {
+                name = folderName
+                mimeType = "application/vnd.google-apps.folder"
+            }
+
+            val folder = service.files().create(folderMetadata)
+                .setFields("id")
+                .execute()
+
+            folderId = folder.id
+            folder.id
+        }
+    }
+
+    suspend fun createFolder(email: String, parentId: String, name: String): File = withContext(Dispatchers.IO) {
+        val service = getDriveService(email)
+        val folderMetadata = File().apply {
+            this.name = name
+            this.mimeType = "application/vnd.google-apps.folder"
+            this.parents = listOf(parentId)
+        }
+        return@withContext service.files().create(folderMetadata)
+            .setFields("id, name, createdTime, mimeType")
+            .execute()
+    }
+
+    suspend fun moveFile(email: String, fileId: String, oldParentId: String, newParentId: String): File = withContext(Dispatchers.IO) {
+        val service = getDriveService(email)
+        return@withContext service.files().update(fileId, null)
+            .setAddParents(newParentId)
+            .setRemoveParents(oldParentId)
+            .setFields("id, parents")
+            .execute()
+    }
+
+    suspend fun copyFile(email: String, fileId: String, newParentId: String): File = withContext(Dispatchers.IO) {
+        val service = getDriveService(email)
+        val copiedFile = File().apply {
+            parents = listOf(newParentId)
+        }
+        return@withContext service.files().copy(fileId, copiedFile)
+            .setFields("id, name, createdTime, webViewLink, thumbnailLink, mimeType, size")
+            .execute()
+    }
+
+    suspend fun listFilesInFolder(email: String, folderId: String): List<File> = withContext(Dispatchers.IO) {
+        val service = getDriveService(email)
+        val query = "'$folderId' in parents and trashed=false"
         val result = service.files().list()
             .setQ(query)
             .setSpaces("drive")
-            .setFields("files(id, name)")
+            .setFields("files(id, name, createdTime, webViewLink, thumbnailLink, mimeType, description, size)")
+            .setOrderBy("folder, createdTime desc")
+            .setPageSize(1000)
             .execute()
-
-        val files = result.files
-        if (!files.isNullOrEmpty()) {
-            folderId = files[0].id
-            return@withContext folderId!!
-        }
-
-        val folderMetadata = File().apply {
-            name = folderName
-            mimeType = "application/vnd.google-apps.folder"
-        }
-
-        val folder = service.files().create(folderMetadata)
-            .setFields("id")
-            .execute()
-
-        folderId = folder.id
-        return@withContext folder.id
+        return@withContext result.files ?: emptyList()
     }
 
     suspend fun uploadFile(email: String, localFile: JavaFile, mimeType: String, title: String, extractedText: String = ""): File = withContext(Dispatchers.IO) {

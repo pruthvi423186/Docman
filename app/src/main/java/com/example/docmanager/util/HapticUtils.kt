@@ -17,6 +17,18 @@ object HapticUtils {
         }
     }
 
+    fun vibrateLight(context: Context) {
+        val vibrator = getVibrator(context)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // 35 milliseconds at 30% amplitude (76 out of 255)
+            vibrator?.vibrate(VibrationEffect.createOneShot(35, 76))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator?.vibrate(35)
+        }
+    }
+
+
     fun vibrateSuccess(context: Context) {
         val vibrator = getVibrator(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

@@ -28,9 +28,21 @@ class UploadWorker @AssistedInject constructor(
 
     override suspend fun doWork(): Result {
         val fileUriString = inputData.getString(KEY_FILE_URI) ?: return Result.failure()
-        val mimeType = inputData.getString(KEY_MIME_TYPE) ?: "application/octet-stream"
+        var mimeType = inputData.getString(KEY_MIME_TYPE) ?: "application/octet-stream"
         var title = inputData.getString(KEY_TITLE) ?: "Document_${System.currentTimeMillis()}"
         val email = inputData.getString(KEY_EMAIL) ?: return Result.failure()
+
+        // Robust MIME type fallback based on extension
+        if (mimeType == "application/octet-stream" || mimeType.isBlank()) {
+            val lowerTitle = title.lowercase()
+            when {
+                lowerTitle.endsWith(".pdf") -> mimeType = "application/pdf"
+                lowerTitle.endsWith(".doc") || lowerTitle.endsWith(".docx") -> mimeType = "application/msword"
+                lowerTitle.endsWith(".xls") || lowerTitle.endsWith(".xlsx") -> mimeType = "application/vnd.ms-excel"
+                lowerTitle.endsWith(".jpg") || lowerTitle.endsWith(".jpeg") -> mimeType = "image/jpeg"
+                lowerTitle.endsWith(".png") -> mimeType = "image/png"
+            }
+        }
 
         try {
             val uri = Uri.parse(fileUriString)
@@ -40,7 +52,9 @@ class UploadWorker @AssistedInject constructor(
                 val compressedFile = ImageUtils.compressImage(context, uri)
                 if (compressedFile != null) {
                     fileToUpload = compressedFile
-                    if (!title.endsWith(".jpg")) title += ".jpg"
+                    if (!title.lowercase().endsWith(".jpg") && !title.lowercase().endsWith(".jpeg") && !title.lowercase().endsWith(".png")) {
+                        title += ".jpg"
+                    }
                 } else {
                     fileToUpload = copyUriToTempFile(context, uri)
                 }
@@ -126,7 +140,7 @@ class UploadWorker @AssistedInject constructor(
 
     private fun copyUriToTempFile(context: Context, uri: Uri): File {
         val inputStream = context.contentResolver.openInputStream(uri)
-        val tempFile = File(context.cacheDir, "temp_upload_${System.currentTimeMillis()}")
+        val tempFile = File(context.cacheDir, "temp_upload_${java.util.UUID.randomUUID()}")
         val outputStream = tempFile.outputStream()
         inputStream?.copyTo(outputStream)
         inputStream?.close()
