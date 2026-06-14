@@ -1,3 +1,8 @@
+<img width="1260" height="2800" alt="1000020437" src="https://github.com/user-attachments/assets/837b6d92-3ea9-42f8-bcf9-8e0875a907f8" />
+<img width="1260" height="2800" alt="1000020439" src="https://github.com/user-attachments/assets/0ff8c4ad-2fb4-4c72-abc7-cd08f0daa639" />
+<img width="1260" height="2800" alt="1000020441" src="https://github.com/user-attachments/assets/4ce5073b-25c2-4ed8-bf94-4e5dce7bdf52" />
+<img width="1260" height="2800" alt="1000020440" src="https://github.com/user-attachments/assets/1ee10908-899a-4189-91cd-5a6817c54793" />
+<img width="1260" height="2800" alt="1000020438" src="https://github.com/user-attachments/assets/47d585a8-0d17-4aba-9cfc-20980335050b" />
 # Docman - Intelligent Document Manager
 
 A premium, modern Android Document Manager that seamlessly integrates with **Google Drive** and **ML Kit**. Built with Jetpack Compose, this app allows you to scan, upload, manage, and organize your documents with a beautiful Glassmorphism-inspired UI.
